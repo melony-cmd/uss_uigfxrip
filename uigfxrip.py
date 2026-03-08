@@ -3,7 +3,6 @@ from tkinter import filedialog
 from PIL import Image, ImageTk
 import struct
 
-FILE = None
 blob = None
 
 WIDTH = 320
@@ -11,15 +10,18 @@ HEIGHT = 256
 
 offset = 0
 planes = 5
+zoom = 2
 
 palette_hits = []
 palette_index = 0
 current_palette = None
 
+last_image = None
 
-# ------------------------
+
+# ------------------------------------------------
 # File
-# ------------------------
+# ------------------------------------------------
 
 def open_file():
     global blob
@@ -38,9 +40,9 @@ def body_size():
     return (WIDTH // 8) * HEIGHT * planes
 
 
-# ------------------------
-# Amiga palette
-# ------------------------
+# ------------------------------------------------
+# Amiga palette helpers
+# ------------------------------------------------
 
 def amiga_to_rgb(word):
 
@@ -74,9 +76,9 @@ def default_palette():
     return palette
 
 
-# ------------------------
-# Renderer
-# ------------------------
+# ------------------------------------------------
+# Bitplane renderer
+# ------------------------------------------------
 
 def render(data):
 
@@ -113,9 +115,81 @@ def render(data):
     return img
 
 
-# ------------------------
-# Palette display
-# ------------------------
+# ------------------------------------------------
+# Copper scan
+# ------------------------------------------------
+
+def scan_copper():
+
+    if blob is None:
+        return None
+
+    pos = offset
+    palette = [0] * 32
+    timeline = []
+
+    while pos + 4 <= len(blob):
+
+        reg, val = struct.unpack(">HH", blob[pos:pos+4])
+        pos += 4
+
+        if reg == 0xFFFF and val == 0xFFFE:
+            break
+
+        if 0x0180 <= reg <= 0x01BE and reg % 2 == 0:
+
+            idx = (reg - 0x0180) // 2
+
+            if idx < 32:
+                palette[idx] = val
+                timeline.append(palette.copy())
+
+    return timeline
+
+
+# ------------------------------------------------
+# Copper visualizer
+# ------------------------------------------------
+
+def draw_copper():
+
+    copper_canvas.delete("all")
+
+    timeline = scan_copper()
+
+    if not timeline:
+        return
+
+    height = HEIGHT * zoom
+
+    scale_y = height // 32
+    scale_x = 4
+
+    for x, pal in enumerate(timeline):
+
+        for y in range(32):
+
+            word = pal[y]
+
+            r = ((word >> 8) & 0xF) * 17
+            g = ((word >> 4) & 0xF) * 17
+            b = (word & 0xF) * 17
+
+            color = f"#{r:02x}{g:02x}{b:02x}"
+
+            copper_canvas.create_rectangle(
+                x * scale_x,
+                y * scale_y,
+                (x + 1) * scale_x,
+                (y + 1) * scale_y,
+                fill=color,
+                outline=""
+            )
+
+
+# ------------------------------------------------
+# Palette preview
+# ------------------------------------------------
 
 def draw_palette():
 
@@ -129,25 +203,29 @@ def draw_palette():
 
     for i in range(colors):
 
-        r = current_palette[i * 3]
-        g = current_palette[i * 3 + 1]
-        b = current_palette[i * 3 + 2]
+        r = current_palette[i*3]
+        g = current_palette[i*3+1]
+        b = current_palette[i*3+2]
 
         color = f"#{r:02x}{g:02x}{b:02x}"
 
-        x0 = i * box
-        x1 = x0 + box
+        palette_canvas.create_rectangle(
+            i*box,
+            0,
+            (i+1)*box,
+            40,
+            fill=color,
+            outline=""
+        )
 
-        palette_canvas.create_rectangle(x0, 0, x1, 40, fill=color, outline="")
 
-
-# ------------------------
-# Image update
-# ------------------------
+# ------------------------------------------------
+# Update image
+# ------------------------------------------------
 
 def update_image():
 
-    global offset
+    global last_image
 
     if blob is None:
         return
@@ -157,11 +235,18 @@ def update_image():
     if offset + size >= len(blob):
         return
 
-    block = blob[offset:offset + size]
+    block = blob[offset:offset+size]
 
     img = render(block)
 
-    preview = ImageTk.PhotoImage(img)
+    last_image = img
+
+    scaled = img.resize((WIDTH * zoom, HEIGHT * zoom), Image.NEAREST)
+
+    preview = ImageTk.PhotoImage(scaled)
+
+    canvas.config(width=WIDTH * zoom, height=HEIGHT * zoom)
+    copper_canvas.config(height=HEIGHT * zoom)
 
     canvas.delete("all")
     canvas.create_image(0, 0, anchor="nw", image=preview)
@@ -170,14 +255,131 @@ def update_image():
     offset_label.config(text=f"Offset: {hex(offset)}")
 
     draw_palette()
+    draw_copper()
 
 
-# ------------------------
-# Offset controls
-# ------------------------
+# ------------------------------------------------
+# Save PNG
+# ------------------------------------------------
+
+def save_png():
+
+    if last_image is None:
+        return
+
+    path = filedialog.asksaveasfilename(
+        defaultextension=".png",
+        filetypes=[("PNG", "*.png")]
+    )
+
+    if not path:
+        return
+
+    last_image.save(path)
+
+
+# ------------------------------------------------
+# Dump copper
+# ------------------------------------------------
+
+def dump_copper():
+
+    if blob is None:
+        return
+
+    pos = offset
+
+    entries = []
+    palette = [0] * 32
+    timeline = []
+
+    while pos + 4 <= len(blob):
+
+        r, v = struct.unpack(">HH", blob[pos:pos+4])
+        pos += 4
+
+        entries.append((r, v))
+
+        if r == 0xFFFF and v == 0xFFFE:
+            break
+
+        if 0x0180 <= r <= 0x01BE and r % 2 == 0:
+
+            idx = (r - 0x0180) // 2
+
+            if idx < 32:
+                palette[idx] = v
+                timeline.append(palette.copy())
+
+    base = f"copper_{offset:08X}"
+
+    with open(base + ".bin", "wb") as f:
+        for r, v in entries:
+            f.write(struct.pack(">HH", r, v))
+
+    with open(base + ".asm", "w") as f:
+
+        f.write(f"; copper list at offset ${offset:08X}\n\n")
+
+        for r, v in entries:
+
+            if r == 0xFFFF and v == 0xFFFE:
+                f.write("dc.w $FFFF,$FFFE ; END\n")
+                break
+
+            if r & 1:
+                f.write(f"dc.w ${r:04X},${v:04X} ; WAIT/SKIP\n")
+            else:
+                f.write(f"dc.w ${r:04X},${v:04X}\n")
+
+    if not timeline:
+        timeline.append(palette.copy())
+
+    width = len(timeline)
+    height = 32
+
+    img = Image.new("RGB", (width, height))
+    pixels = img.load()
+
+    for x, pal in enumerate(timeline):
+
+        for y in range(32):
+
+            word = pal[y]
+
+            r = ((word >> 8) & 0xF) * 17
+            g = ((word >> 4) & 0xF) * 17
+            b = (word & 0xF) * 17
+
+            pixels[x, y] = (r, g, b)
+
+    img = img.resize((width * 6, height * 6), Image.NEAREST)
+    img.save(base + ".png")
+
+    print("Copper dumped:", base)
+
+
+# ------------------------------------------------
+# Controls
+# ------------------------------------------------
+
+def next_offset():
+    global offset
+    offset += int(video_step_entry.get())
+    update_image()
+
+
+def prev_offset():
+    global offset
+    offset -= int(video_step_entry.get())
+
+    if offset < 0:
+        offset = 0
+
+    update_image()
+
 
 def set_offset():
-
     global offset
 
     try:
@@ -188,47 +390,40 @@ def set_offset():
     update_image()
 
 
-def next_offset():
-
-    global offset
-
-    step = int(video_step_entry.get())
-
-    offset += step
-
-    update_image()
-
-
-def prev_offset():
-
-    global offset
-
-    step = int(video_step_entry.get())
-
-    offset -= step
-
-    if offset < 0:
-        offset = 0
-
-    update_image()
-
-
-# ------------------------
-# Bitplanes
-# ------------------------
-
 def change_planes(v):
-
     global planes
-
     planes = int(v)
-
     update_image()
 
 
-# ------------------------
+def change_zoom(v):
+    global zoom
+    zoom = int(v)
+    update_image()
+
+
+# ------------------------------------------------
+# Keyboard
+# ------------------------------------------------
+
+def keypress(event):
+
+    if event.keysym == "Up":
+        prev_offset()
+
+    elif event.keysym == "Down":
+        next_offset()
+
+    elif event.keysym == "Prior":
+        prev_palette()
+
+    elif event.keysym == "Next":
+        next_palette()
+
+
+# ------------------------------------------------
 # Palette search
-# ------------------------
+# ------------------------------------------------
 
 def search_palettes():
 
@@ -244,7 +439,7 @@ def search_palettes():
 
     for i in range(len(blob) - size):
 
-        words = struct.unpack(">" + "H" * colors, blob[i:i + size])
+        words = struct.unpack(">" + "H" * colors, blob[i:i+size])
 
         if all(w <= 0x0FFF for w in words):
 
@@ -266,7 +461,7 @@ def apply_palette():
     colors = 2 ** planes
     size = colors * 2
 
-    words = struct.unpack(">" + "H" * colors, blob[pos:pos + size])
+    words = struct.unpack(">" + "H" * colors, blob[pos:pos+size])
 
     current_palette = build_palette(words)
 
@@ -274,57 +469,22 @@ def apply_palette():
 
 
 def next_palette():
-
     global palette_index
-
-    if not palette_hits:
-        return
-
-    step = int(palette_step_entry.get())
-
-    palette_index += step
-    palette_index %= len(palette_hits)
-
-    apply_palette()
+    if palette_hits:
+        palette_index = (palette_index + 1) % len(palette_hits)
+        apply_palette()
 
 
 def prev_palette():
-
     global palette_index
-
-    if not palette_hits:
-        return
-
-    step = int(palette_step_entry.get())
-
-    palette_index -= step
-    palette_index %= len(palette_hits)
-
-    apply_palette()
+    if palette_hits:
+        palette_index = (palette_index - 1) % len(palette_hits)
+        apply_palette()
 
 
-# ------------------------
-# Keyboard controls
-# ------------------------
-
-def keypress(event):
-
-    if event.keysym == "Up":
-        prev_offset()
-
-    elif event.keysym == "Down":
-        next_offset()
-
-    elif event.keysym == "Prior":
-        prev_palette()
-
-    elif event.keysym == "Next":
-        next_palette()
-
-
-# ------------------------
+# ------------------------------------------------
 # UI
-# ------------------------
+# ------------------------------------------------
 
 root = tk.Tk()
 root.title("uigfxrip")
@@ -332,21 +492,24 @@ root.title("uigfxrip")
 main = tk.Frame(root)
 main.pack(padx=10, pady=10)
 
+copper_canvas = tk.Canvas(main, width=256, height=HEIGHT * zoom, bg="black")
+copper_canvas.grid(row=0, column=0, rowspan=2, padx=10)
+
 canvas = tk.Canvas(main, width=WIDTH, height=HEIGHT, bg="black")
-canvas.grid(row=0, column=0)
+canvas.grid(row=0, column=1)
 
 palette_canvas = tk.Canvas(main, width=WIDTH, height=40, bg="black")
-palette_canvas.grid(row=1, column=0, pady=5)
+palette_canvas.grid(row=1, column=1, pady=5)
 
 ui = tk.Frame(main)
-ui.grid(row=0, column=1, rowspan=2, padx=15, sticky="n")
+ui.grid(row=0, column=2, rowspan=2, padx=15, sticky="n")
 
 tk.Button(ui, text="Open File", command=open_file).pack(fill="x")
+tk.Button(ui, text="Save PNG", command=save_png).pack(fill="x")
+tk.Button(ui, text="Dump Copper", command=dump_copper).pack(fill="x")
 
 offset_label = tk.Label(ui, text="Offset: 0x0")
 offset_label.pack()
-
-tk.Label(ui, text="Offset (hex)").pack()
 
 offset_entry = tk.Entry(ui)
 offset_entry.insert(0, "0x0")
@@ -369,15 +532,15 @@ plane_slider = tk.Scale(ui, from_=1, to=5, orient="horizontal", command=change_p
 plane_slider.set(5)
 plane_slider.pack()
 
+tk.Label(ui, text="Zoom").pack()
+
+zoom_slider = tk.Scale(ui, from_=1, to=6, orient="horizontal", command=change_zoom)
+zoom_slider.set(2)
+zoom_slider.pack()
+
 tk.Label(ui, text="Palette").pack()
 
 tk.Button(ui, text="Search", command=search_palettes).pack(fill="x")
-
-tk.Label(ui, text="Palette Step").pack()
-
-palette_step_entry = tk.Entry(ui)
-palette_step_entry.insert(0, "1")
-palette_step_entry.pack()
 
 palframe = tk.Frame(ui)
 palframe.pack()
